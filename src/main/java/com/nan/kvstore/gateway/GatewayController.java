@@ -7,10 +7,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -40,14 +42,20 @@ public class GatewayController {
     private static final int DEFAULT_W = 2;
     private static final int DEFAULT_R = 2;
 
-    // Just for debugging: helps you confirm you're hitting the NEW gateway
-    private static final String GATEWAY_BUILD = "GATEWAY_6B_HEALTH_AWARE_v1";
+    // Debug build string (helps confirm correct gateway instance)
+    private static final String GATEWAY_BUILD = "GATEWAY_6C_HINTED_HANDOFF_v1";
 
     /*
       Health table maintained by gateway:
       nodeHealth[nodeUrl] = true/false
     */
     private final Map<String, Boolean> nodeHealth = new ConcurrentHashMap<>();
+
+    /*
+      Hinted handoff store:
+      hintsByNode[targetNode] = deque of missed writes that should be delivered later
+    */
+    private final Map<String, ConcurrentLinkedDeque<Hint>> hintsByNode = new ConcurrentHashMap<>();
 
     public GatewayController() {
         // initialize health to true so startup isn't blocked
@@ -62,10 +70,14 @@ public class GatewayController {
         Thread healthThread = new Thread(this::healthLoop);
         healthThread.setDaemon(true);
         healthThread.start();
+
+        // Background thread: try hinted handoff delivery every 2 seconds
+        Thread handoffThread = new Thread(this::handoffLoop);
+        handoffThread.setDaemon(true);
+        handoffThread.start();
     }
 
-    // A quick endpoint to confirm you are hitting THIS gateway instance
-    // GET /gkv/whoami
+    // ------------------ Debug: confirm correct gateway ------------------
     @GetMapping("/whoami")
     public ResponseEntity<String> whoami() {
         return ResponseEntity.ok(GATEWAY_BUILD);
@@ -88,8 +100,6 @@ public class GatewayController {
     private boolean isNodeUp(String nodeBaseUrl) {
         try {
             String url = nodeBaseUrl + "/kv/health";
-
-            // We only care about HTTP 200. We don't need JSON parsing here.
             ResponseEntity<String> resp = restTemplate.exchange(url, HttpMethod.GET, null, String.class);
             return resp.getStatusCode().is2xxSuccessful();
         } catch (Exception e) {
@@ -98,10 +108,8 @@ public class GatewayController {
     }
 
     // For debugging: see which nodes are currently UP/DOWN
-    // GET /gkv/cluster/health
     @GetMapping("/cluster/health")
     public ResponseEntity<Map<String, Boolean>> clusterHealth() {
-        // ensure no nulls
         Map<String, Boolean> snapshot = new LinkedHashMap<>();
         for (String n : allNodes) {
             snapshot.put(n, Boolean.TRUE.equals(nodeHealth.get(n)));
@@ -109,19 +117,95 @@ public class GatewayController {
         return ResponseEntity.ok(snapshot);
     }
 
-    // Pick replica list for key, filtered by health
-    private List<String> healthyReplicasForKey(String key) {
-        List<String> replicas = router.pickReplicaNodes(key, N);
-        List<String> healthy = new ArrayList<>();
-        for (String r : replicas) {
-            if (Boolean.TRUE.equals(nodeHealth.get(r))) {
-                healthy.add(r);
+    // ------------------ HINTED HANDOFF LOOP ------------------
+    // Periodically tries to deliver queued hints to nodes that are healthy again.
+    private void handoffLoop() {
+        while (true) {
+            try {
+                flushHintsInternal();
+                Thread.sleep(2000);
+            } catch (InterruptedException ignored) {
+            } catch (Exception ignored) {
+                // keep loop alive even if something unexpected happens
             }
         }
-        return healthy;
     }
 
-    // ------------------ PUT (health-aware quorum write) ------------------
+    private void addHint(String targetNode, Hint hint) {
+        hintsByNode.computeIfAbsent(targetNode, k -> new ConcurrentLinkedDeque<>()).add(hint);
+    }
+
+    // Debug: how many hints are pending per node
+    @GetMapping("/handoff/pending")
+    public ResponseEntity<Map<String, Integer>> pendingHints() {
+        Map<String, Integer> out = new LinkedHashMap<>();
+        for (String n : allNodes) {
+            ConcurrentLinkedDeque<Hint> q = hintsByNode.get(n);
+            out.put(n, q == null ? 0 : q.size());
+        }
+        return ResponseEntity.ok(out);
+    }
+
+    // Manual flush endpoint (in addition to background loop)
+    @PostMapping("/handoff/flush")
+    public ResponseEntity<String> flushHints() {
+        FlushResult r = flushHintsInternal();
+        return ResponseEntity.ok("HINTED HANDOFF FLUSHED. delivered=" + r.delivered + " remaining=" + r.remaining);
+    }
+
+    private FlushResult flushHintsInternal() {
+        int delivered = 0;
+        int remaining = 0;
+
+        for (String node : allNodes) {
+            // Only attempt delivery if node is healthy now
+            if (!Boolean.TRUE.equals(nodeHealth.get(node))) {
+                // count remaining without modifying queue
+                ConcurrentLinkedDeque<Hint> q = hintsByNode.get(node);
+                if (q != null) remaining += q.size();
+                continue;
+            }
+
+            ConcurrentLinkedDeque<Hint> q = hintsByNode.get(node);
+            if (q == null || q.isEmpty()) continue;
+
+            // Deliver in FIFO order
+            int triesThisNode = q.size();
+            for (int i = 0; i < triesThisNode; i++) {
+                Hint h = q.pollFirst();
+                if (h == null) break;
+
+                String url = node + "/kv/put?key=" + h.key + "&value=" + h.value + "&version=" + h.version;
+                try {
+                    restTemplate.exchange(url, HttpMethod.PUT, null, VersionedValue.class);
+                    delivered++;
+                } catch (RestClientException e) {
+                    // Still failing -> re-queue at end
+                    q.addLast(h);
+                    remaining++;
+                }
+            }
+
+            if (q.isEmpty()) {
+                hintsByNode.remove(node);
+            } else {
+                remaining += q.size();
+            }
+        }
+
+        return new FlushResult(delivered, remaining);
+    }
+
+    private static class FlushResult {
+        int delivered;
+        int remaining;
+        FlushResult(int delivered, int remaining) {
+            this.delivered = delivered;
+            this.remaining = remaining;
+        }
+    }
+
+    // ------------------ PUT (quorum write + hinted handoff) ------------------
     @PutMapping("/put")
     public ResponseEntity<String> put(@RequestParam String key,
                                       @RequestParam String value,
@@ -130,50 +214,78 @@ public class GatewayController {
         if (w < 1) w = 1;
         if (w > N) w = N;
 
-        List<String> healthyReplicas = healthyReplicasForKey(key);
-
-        // Fail fast if quorum is impossible
-        if (healthyReplicas.size() < w) {
-            return ResponseEntity.status(503).body(
-                    "WRITE FAILED FAST. Not enough healthy replicas for w=" + w +
-                            ". Healthy=" + healthyReplicas + " HealthTable=" + clusterHealth().getBody()
-            );
-        }
-
         long version = System.currentTimeMillis();
 
+        // Intended replicas for this key (based on consistent hashing ring)
+        List<String> replicas = router.pickReplicaNodes(key, N);
+
         List<String> successes = new ArrayList<>();
+        List<String> queuedHints = new ArrayList<>();
         List<String> failures = new ArrayList<>();
 
-        // Try only healthy replicas; stop once quorum is met
-        for (String node : healthyReplicas) {
-            if (successes.size() >= w) break;
+        // Important: we always consider ALL intended replicas for hints.
+        // We only attempt network calls to healthy nodes.
+        for (String node : replicas) {
+            boolean healthy = Boolean.TRUE.equals(nodeHealth.get(node));
 
+            if (!healthy) {
+                // node is down -> queue hint so it can catch up when it returns
+                addHint(node, new Hint(key, value, version, System.currentTimeMillis()));
+                queuedHints.add(node);
+                continue;
+            }
+
+            // node healthy -> attempt write
             String url = node + "/kv/put?key=" + key + "&value=" + value + "&version=" + version;
             try {
                 restTemplate.exchange(url, HttpMethod.PUT, null, VersionedValue.class);
                 successes.add(node);
+
+                // optimization: once quorum is met, we can stop trying more healthy nodes
+                // BUT we must still queue hints for any remaining unhealthy replicas,
+                // which we already do above based on health table.
+                if (successes.size() >= w) {
+                    // we can stop here, but there could be more healthy nodes we would have tried.
+                    // In Dynamo, a coordinator may do full replication asynchronously.
+                    // For this project, quorum is enough for success.
+                }
             } catch (RestClientException e) {
+                // write failed even though we thought node is healthy -> treat as down and queue hint
+                nodeHealth.put(node, false);
+                addHint(node, new Hint(key, value, version, System.currentTimeMillis()));
                 failures.add(node);
+                queuedHints.add(node);
+            }
+
+            if (successes.size() >= w) {
+                // stop attempting further healthy replicas once quorum is satisfied
+                // (replication to remaining replicas happens via hinted handoff when needed)
+                // NOTE: this makes write latency smaller in failure cases.
+                break;
             }
         }
 
+        // Fail fast if quorum not satisfied
         if (successes.size() < w) {
-            return ResponseEntity.status(500).body(
+            return ResponseEntity.status(503).body(
                     "WRITE FAILED (need w=" + w + "). version=" + version +
-                            " Success=" + successes + " Fail=" + failures
+                            " Success=" + successes +
+                            " Fail=" + failures +
+                            " HintsQueuedFor=" + queuedHints +
+                            " Replicas=" + replicas +
+                            " HealthTable=" + clusterHealth().getBody()
             );
         }
 
         return ResponseEntity.ok(
                 "WRITE QUORUM OK (w=" + w + "). version=" + version +
                         " Success=" + successes +
-                        (failures.isEmpty() ? "" : " Fail=" + failures) +
-                        " HealthyCandidates=" + healthyReplicas
+                        (queuedHints.isEmpty() ? "" : " HintsQueuedFor=" + queuedHints) +
+                        " Replicas=" + replicas
         );
     }
 
-    // ------------------ GET (health-aware quorum read) ------------------
+    // ------------------ GET (health-aware quorum read + newest + read repair) ------------------
     @GetMapping("/get")
     public ResponseEntity<String> get(@RequestParam String key,
                                       @RequestParam(defaultValue = "" + DEFAULT_R) int r,
@@ -182,20 +294,26 @@ public class GatewayController {
         if (r < 1) r = 1;
         if (r > N) r = N;
 
-        List<String> healthyReplicas = healthyReplicasForKey(key);
+        List<String> replicas = router.pickReplicaNodes(key, N);
 
-        // Fail fast if quorum is impossible
-        if (healthyReplicas.size() < r) {
+        // Read only from healthy replicas (otherwise we'd waste timeouts)
+        List<String> healthy = new ArrayList<>();
+        for (String node : replicas) {
+            if (Boolean.TRUE.equals(nodeHealth.get(node))) healthy.add(node);
+        }
+
+        if (healthy.size() < r) {
             return ResponseEntity.status(503).body(
                     "READ FAILED FAST. Not enough healthy replicas for r=" + r +
-                            ". Healthy=" + healthyReplicas + " HealthTable=" + clusterHealth().getBody()
+                            ". Healthy=" + healthy +
+                            " Replicas=" + replicas +
+                            " HealthTable=" + clusterHealth().getBody()
             );
         }
 
         List<ReplicaRead> reads = new ArrayList<>();
 
-        // Collect r successful reads
-        for (String node : healthyReplicas) {
+        for (String node : healthy) {
             if (reads.size() >= r) break;
 
             String url = node + "/kv/get?key=" + key;
@@ -207,13 +325,16 @@ public class GatewayController {
                     reads.add(new ReplicaRead(node, resp.getBody()));
                 }
             } catch (RestClientException ignored) {
+                // If a healthy node suddenly fails, mark it down
+                nodeHealth.put(node, false);
             }
         }
 
         if (reads.size() < r) {
             return ResponseEntity.status(500).body(
                     "READ FAILED (need r=" + r + "). Only got " + reads.size() +
-                            " SuccessfulReadsFrom=" + reads
+                            " SuccessfulReads=" + reads +
+                            " HealthyCandidates=" + healthy
             );
         }
 
@@ -221,7 +342,7 @@ public class GatewayController {
                 .max(Comparator.comparingLong(rr -> rr.value.getVersion()))
                 .get();
 
-        // Read repair (only among replicas we successfully read)
+        // Read repair among the replicas we successfully contacted
         if (repair) {
             for (ReplicaRead rr : reads) {
                 if (rr.value.getVersion() < newest.value.getVersion()) {
@@ -240,10 +361,11 @@ public class GatewayController {
                 "READ QUORUM OK (r=" + r + "). NewestFrom=" + newest.node +
                         " version=" + newest.value.getVersion() +
                         " value=" + newest.value.getValue() +
-                        " HealthyCandidates=" + healthyReplicas
+                        " HealthyCandidates=" + healthy
         );
     }
 
+    // ------------------ Helper types ------------------
     private static class ReplicaRead {
         String node;
         VersionedValue value;
@@ -256,6 +378,20 @@ public class GatewayController {
         @Override
         public String toString() {
             return "{node=" + node + ", version=" + (value == null ? "null" : value.getVersion()) + "}";
+        }
+    }
+
+    private static class Hint {
+        String key;
+        String value;
+        long version;
+        long createdAtMs;
+
+        Hint(String key, String value, long version, long createdAtMs) {
+            this.key = key;
+            this.value = value;
+            this.version = version;
+            this.createdAtMs = createdAtMs;
         }
     }
 }
